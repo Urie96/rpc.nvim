@@ -568,7 +568,7 @@ function M.setup(opts)
   if opts.build_request_command ~= nil and type(opts.build_request_command) ~= 'function' then
     error 'rpc.setup() requires build_request_command to be a function'
   end
-  state.build_fn = opts.build_request_command or M.build_curl_command
+  state.build_fn = opts.build_request_command or state.build_fn or M.build_curl_command
 end
 
 local function notify_unresolved_variables(unresolved_variables)
