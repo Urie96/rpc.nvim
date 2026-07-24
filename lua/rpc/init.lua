@@ -1,9 +1,20 @@
 -- rpc.nvim — RPC request runner with response preview
 --
--- Filetype: rpc          for request files (PSM/Method metadata + JSON body)
--- Filetype: rpc_response  for response preview (metadata headers + JSON body)
+-- Filetype: rpc          for request files (first line + metadata + body)
+-- Filetype: rpc_response  for response preview (first line, metadata, body)
 --
 -- Usage:
+--   require('rpc').setup({
+--     build_request_command = function(first_line, metadata, body)
+--       -- Build a command from the parsed request.
+--       -- @param first_line  string                First line of the request (required)
+--       -- @param metadata    table<string,list>    Metadata key→list of values
+--       -- @param body        string|nil            Request body after blank-line separator
+--       -- @return command   string[]              Argument list for vim.system
+--       -- @return parse_fn  function              Response parser:
+--       --   parse_fn(stdout) -> first_line (string), metadata (table), body (string)
+--     end,
+--   })
 --   require('rpc').run_current()
 --   Or map <CR> in rpc buffers to trigger it automatically.
 
@@ -14,9 +25,8 @@ local state = {
   preview_win = nil,
   running = false,
   start_time = nil,
+  build_fn = nil,
 }
-
-local DEFAULT_COMMAND = 'bam'
 
 local function notify(msg, level)
   vim.notify(msg, level or vim.log.levels.INFO, { title = 'rpc' })
@@ -34,20 +44,16 @@ local function is_separator(line)
   return line ~= nil and line:match '^%s*###' ~= nil
 end
 
-local function is_metadata_comment(line)
+local function is_comment(line)
   return line ~= nil and not is_separator(line) and line:match '^%s*#' ~= nil
 end
 
-local function get_command_prefix()
-  local configured = vim.g.rpc_runner_command
-  if configured == nil then return { DEFAULT_COMMAND } end
-  if type(configured) == 'string' and configured ~= '' then return { configured } end
-  if type(configured) == 'table' and #configured > 0 then return vim.deepcopy(configured) end
-  error 'vim.g.rpc_command is not configured'
-end
+--- ── Buffer / window helpers ──────────────────────────────────────────
 
 local function ensure_preview_buffer()
-  if state.preview_buf and vim.api.nvim_buf_is_valid(state.preview_buf) then return state.preview_buf end
+  if state.preview_buf and vim.api.nvim_buf_is_valid(state.preview_buf) then
+    return state.preview_buf
+  end
 
   local buf = vim.api.nvim_create_buf(false, true)
   state.preview_buf = buf
@@ -75,11 +81,20 @@ local function configure_preview_window(win)
 end
 
 local function resize_preview_equal(current_win)
-  if not (state.preview_win and vim.api.nvim_win_is_valid(state.preview_win)) then return end
-  if not vim.api.nvim_win_is_valid(current_win) or current_win == state.preview_win then return end
+  if not (state.preview_win and vim.api.nvim_win_is_valid(state.preview_win)) then
+    return
+  end
+  if not vim.api.nvim_win_is_valid(current_win) or current_win == state.preview_win then
+    return
+  end
 
-  local total_width = vim.api.nvim_win_get_width(current_win) + vim.api.nvim_win_get_width(state.preview_win)
-  pcall(vim.api.nvim_win_set_width, state.preview_win, math.floor(total_width / 2))
+  local total_width = vim.api.nvim_win_get_width(current_win)
+    + vim.api.nvim_win_get_width(state.preview_win)
+  pcall(
+    vim.api.nvim_win_set_width,
+    state.preview_win,
+    math.floor(total_width / 2)
+  )
 end
 
 local function ensure_preview_window()
@@ -103,16 +118,31 @@ local function ensure_preview_window()
   return buf
 end
 
-local function set_preview_content(body, metadata)
+--- ── Response display ─────────────────────────────────────────────────
+
+local function set_preview_content(first_line, metadata, body)
   local buf = ensure_preview_window()
 
   local parts = {}
+  table.insert(parts, first_line or '')
+
   if metadata then
-    for _, kv in ipairs(metadata) do
-      table.insert(parts, kv[1] .. ': ' .. kv[2])
+    local keys = vim.tbl_keys(metadata)
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+      local values = metadata[key]
+      if type(values) == 'table' then
+        for _, value in ipairs(values) do
+          table.insert(parts, key .. ': ' .. value)
+        end
+      else
+        -- fallback for scalar values (defensive)
+        table.insert(parts, key .. ': ' .. tostring(values))
+      end
     end
-    table.insert(parts, '')
   end
+
+  table.insert(parts, '')
   table.insert(parts, body or '')
 
   local text = table.concat(parts, '\n')
@@ -124,6 +154,8 @@ local function set_preview_content(body, metadata)
   vim.bo[buf].modified = false
   vim.bo[buf].filetype = 'rpc_response'
 end
+
+--- ── Request parsing ──────────────────────────────────────────────────
 
 local function get_block_range(lines, cursor_line)
   local block_start
@@ -157,17 +189,27 @@ local function get_block_range(lines, cursor_line)
     block_end = block_end - 1
   end
 
-  if block_start > block_end then error 'empty request block' end
+  if block_start > block_end then
+    error 'empty request block'
+  end
 
   return block_start, block_end
 end
 
 local function parse_metadata_line(line, line_nr)
   local key, value = line:match '^%s*([^:]+)%s*:%s*(.-)%s*$'
-  if not key then error(('invalid metadata at line %d: %s'):format(line_nr, line)) end
+  if not key then
+    error(('invalid metadata at line %d: %s'):format(line_nr, line))
+  end
   return trim(key), trim(value)
 end
 
+--- Parse the request block under the cursor.
+---
+--- Returns `first_line, metadata, body_raw` where:
+---   - first_line (string)  — first non-blank non-comment line (required)
+---   - metadata   (table<string,list<string>>)
+---   - body_raw   (string)
 local function parse_current_request()
   local buf = vim.api.nvim_get_current_buf()
   local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
@@ -179,6 +221,8 @@ local function parse_current_request()
     table.insert(block_lines, lines[line_nr])
   end
 
+  -- Find the first blank line – it separates header (first line + metadata)
+  -- from the optional body.
   local separator_idx = nil
   for idx, line in ipairs(block_lines) do
     if is_blank(line) then
@@ -187,26 +231,47 @@ local function parse_current_request()
     end
   end
 
-  local metadata = {}
-  local seen_keys = {}
-  local metadata_end = separator_idx and (separator_idx - 1) or #block_lines
+  local header_end = separator_idx and (separator_idx - 1) or #block_lines
 
-  for idx = 1, metadata_end do
+  -- ── First line (required) ──────────────────────────────────────────
+  local first_line = nil
+  local first_line_idx = nil
+  for idx = 1, header_end do
     local line = block_lines[idx]
-    if not is_metadata_comment(line) then
+    if not is_blank(line) and not is_comment(line) then
+      first_line = line
+      first_line_idx = idx
+      break
+    end
+  end
+  if not first_line then
+    error 'missing required first line'
+  end
+
+  -- Validate first line has exactly two parts separated by whitespace
+  -- e.g., "RPC SayHello" or "GET /path"
+  local parts = vim.split(first_line, '%s+')
+  if #parts ~= 2 then
+    error(
+      ('first line must have exactly two parts (e.g., "RPC SayHello"), got %d: %s')
+      :format(#parts, first_line)
+    )
+  end
+
+  -- ── Metadata (optional, duplicate keys → list) ─────────────────────
+  local metadata = {}
+  for idx = first_line_idx + 1, header_end do
+    local line = block_lines[idx]
+    if not is_blank(line) and not is_comment(line) then
       local key, value = parse_metadata_line(line, block_start + idx - 1)
-      if seen_keys[key] then error('duplicate metadata: ' .. key) end
-      seen_keys[key] = true
-      metadata[key] = value
+      if not metadata[key] then
+        metadata[key] = {}
+      end
+      table.insert(metadata[key], value)
     end
   end
 
-  local psm = metadata.PSM
-  local method = metadata.Method
-
-  if not psm or psm == '' then error 'missing required metadata: PSM' end
-  if not method or method == '' then error 'missing required metadata: Method' end
-
+  -- ── Body (optional) ────────────────────────────────────────────────
   local body_raw = ''
   if separator_idx then
     local body_lines = {}
@@ -216,53 +281,25 @@ local function parse_current_request()
     body_raw = table.concat(body_lines, '\n')
   end
 
-  return {
-    psm = psm,
-    method = method,
-    metadata = metadata,
-    body_raw = body_raw,
-    range = { start_line = block_start, end_line = block_end },
-  }
+  return first_line, metadata, body_raw
 end
 
-local function build_bam_command(request)
-  local metadata = request.metadata
-  local command = get_command_prefix()
-  local ignored = {}
+--- ── Setup (public API) ───────────────────────────────────────────────
 
-  if metadata.IDLBranch and metadata.IDL_BRANCH and metadata.IDLBranch ~= metadata.IDL_BRANCH then
-    error 'conflicting metadata: IDLBranch and IDL_BRANCH'
+--- Configure rpc.nvim with a user-provided command builder.
+---
+--- @param opts table  Must contain `build_request_command` function.
+function M.setup(opts)
+  if type(opts) ~= 'table' then
+    error('rpc.setup() requires a table argument')
   end
-
-  table.insert(command, request.psm)
-  table.insert(command, request.method)
-  table.insert(command, '-')
-
-  if metadata.ENV and metadata.ENV ~= '' then
-    table.insert(command, '--env')
-    table.insert(command, metadata.ENV)
+  if type(opts.build_request_command) ~= 'function' then
+    error('rpc.setup() requires build_request_command function')
   end
-
-  if metadata.IDC and metadata.IDC ~= '' then
-    table.insert(command, '--idc')
-    table.insert(command, metadata.IDC)
-  end
-
-  local idl_branch = metadata.IDLBranch or metadata.IDL_BRANCH
-  if idl_branch and idl_branch ~= '' then
-    table.insert(command, '--idl-branch')
-    table.insert(command, idl_branch)
-  end
-
-  for key, _ in pairs(metadata) do
-    if key ~= 'PSM' and key ~= 'Method' and key ~= 'ENV' and key ~= 'IDC' and key ~= 'IDLBranch' and key ~= 'IDL_BRANCH' then
-      table.insert(ignored, key)
-    end
-  end
-  table.sort(ignored)
-
-  return command, ignored
+  state.build_fn = opts.build_request_command
 end
+
+--- ── Run current request ──────────────────────────────────────────────
 
 function M.run_current()
   if state.running then
@@ -270,60 +307,94 @@ function M.run_current()
     return
   end
 
-  local ok, request_or_err = pcall(parse_current_request)
+  if not state.build_fn then
+    notify(
+      'rpc.nvim: setup() has not been called. Use require("rpc").setup({...}).',
+      vim.log.levels.ERROR
+    )
+    return
+  end
+
+  -- Parse the request buffer ──────────────────────────────────────────
+  local ok, first_line, metadata, body_raw = pcall(parse_current_request)
   if not ok then
-    notify(request_or_err, vim.log.levels.ERROR)
+    notify(first_line, vim.log.levels.ERROR) -- first_line is the error string
     return
   end
 
-  local request = request_or_err
-  local command_ok, command_or_err, ignored_metadata = pcall(build_bam_command, request)
-  if not command_ok then
-    notify(command_or_err, vim.log.levels.ERROR)
+  -- Build command + parse function ────────────────────────────────────
+  local ok_build, result1, result2 = pcall(state.build_fn, first_line, metadata, body_raw)
+  if not ok_build then
+    notify(result1, vim.log.levels.ERROR)
     return
   end
 
-  local command = command_or_err
+  local command = result1
+  local parse_fn = result2
+
+  if type(command) ~= 'table' or #command == 0 then
+    notify(
+      'build_request_command must return a non-empty command array',
+      vim.log.levels.ERROR
+    )
+    return
+  end
+  if type(parse_fn) ~= 'function' then
+    notify(
+      'build_request_command must return a parse function as second return value',
+      vim.log.levels.ERROR
+    )
+    return
+  end
+
   local executable = command[1]
   if vim.fn.executable(executable) == 0 then
     notify('rpc command is not executable: ' .. executable, vim.log.levels.ERROR)
     return
   end
 
-  if #ignored_metadata > 0 then
-    notify('Ignored metadata: ' .. table.concat(ignored_metadata, ', '), vim.log.levels.WARN)
-  end
-
+  -- Execute ───────────────────────────────────────────────────────────
   state.running = true
   state.start_time = vim.loop.now()
-  set_preview_content('{"_status": "loading"}')
+  set_preview_content('', {}, '{"_status": "loading"}')
 
-  local spawn_ok, spawn_err = pcall(vim.system, command, { stdin = request.body_raw, text = true }, function(result)
-    state.running = false
-    vim.schedule(function()
-      local elapsed_ms = math.floor(vim.loop.now() - state.start_time)
-
-      local metadata = {
-        { 'Status', result.code == 0 and 'OK' or tostring(result.code) },
-        { 'Latency', elapsed_ms .. 'ms' },
-        { 'PSM', request.psm },
-        { 'Method', request.method },
-      }
-
-      set_preview_content(result.stdout or '', metadata)
-
-      if result.code ~= 0 or (result.stderr and result.stderr ~= '') then
-        local messages = {}
-        if result.code ~= 0 then
-          table.insert(messages, ('exit code: %d'):format(result.code))
+  local spawn_ok, spawn_err = pcall(
+    vim.system,
+    command,
+    { stdin = body_raw, text = true },
+    function(result)
+      state.running = false
+      vim.schedule(function()
+        -- Parse the response via the user-provided parse function
+        local ok_resp, resp_first_line, resp_metadata, resp_body =
+          pcall(parse_fn, result.stdout or '')
+        if not ok_resp then
+          notify(
+            'parse function error: ' .. tostring(resp_first_line),
+            vim.log.levels.WARN
+          )
+          set_preview_content('', {}, result.stdout or '')
+        else
+          set_preview_content(resp_first_line, resp_metadata, resp_body)
         end
-        if result.stderr and result.stderr ~= '' then
-          table.insert(messages, result.stderr)
+
+        -- Notify on non-zero exit or stderr output
+        if result.code ~= 0 or (result.stderr and result.stderr ~= '') then
+          local messages = {}
+          if result.code ~= 0 then
+            table.insert(messages, ('exit code: %d'):format(result.code))
+          end
+          if result.stderr and result.stderr ~= '' then
+            table.insert(messages, result.stderr)
+          end
+          notify(
+            table.concat(messages, '\n'),
+            result.code ~= 0 and vim.log.levels.ERROR or vim.log.levels.WARN
+          )
         end
-        notify(table.concat(messages, '\n'), result.code ~= 0 and vim.log.levels.ERROR or vim.log.levels.WARN)
-      end
-    end)
-  end)
+      end)
+    end
+  )
 
   if not spawn_ok then
     state.running = false
