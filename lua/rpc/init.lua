@@ -1,10 +1,10 @@
--- rpc_runner.nvim — RPC request runner with response preview
+-- rpc.nvim — RPC request runner with response preview
 --
 -- Filetype: rpc          for request files (PSM/Method metadata + JSON body)
 -- Filetype: rpc_response  for response preview (metadata headers + JSON body)
 --
 -- Usage:
---   require('rpc_runner').run_current()
+--   require('rpc').run_current()
 --   Or map <CR> in rpc buffers to trigger it automatically.
 
 local M = {}
@@ -19,7 +19,7 @@ local state = {
 local DEFAULT_COMMAND = 'bam'
 
 local function notify(msg, level)
-  vim.notify(msg, level or vim.log.levels.INFO, { title = 'rpc_runner' })
+  vim.notify(msg, level or vim.log.levels.INFO, { title = 'rpc' })
 end
 
 local function trim(text)
@@ -43,7 +43,7 @@ local function get_command_prefix()
   if configured == nil then return { DEFAULT_COMMAND } end
   if type(configured) == 'string' and configured ~= '' then return { configured } end
   if type(configured) == 'table' and #configured > 0 then return vim.deepcopy(configured) end
-  error 'vim.g.rpc_runner_command is not configured'
+  error 'vim.g.rpc_command is not configured'
 end
 
 local function ensure_preview_buffer()
