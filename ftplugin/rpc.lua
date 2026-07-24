@@ -37,6 +37,14 @@ vim.keymap.set('n', '<CR>', function()
   require('rpc').run_current()
 end, { buffer = true, silent = true, desc = 'Run current RPC request' })
 
+vim.keymap.set('n', '<leader>i', function()
+  require('rpc').inspect_current()
+end, { buffer = true, silent = true, desc = 'Inspect current RPC request command' })
+
 vim.api.nvim_buf_create_user_command(0, 'RpcRun', function()
   require('rpc').run_current()
 end, { desc = 'Run current RPC request' })
+
+vim.api.nvim_buf_create_user_command(0, 'RpcInspect', function()
+  require('rpc').inspect_current()
+end, { desc = 'Inspect current RPC request command' })
